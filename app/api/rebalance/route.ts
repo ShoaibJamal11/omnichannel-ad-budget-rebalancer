@@ -1,122 +1,139 @@
 import { NextResponse } from "next/server";
-import Groq from "groq-sdk";
-
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY || "",
-});
-
-function cleanAndParseJSON(text: string) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    const firstBrace = text.indexOf("{");
-    const lastBrace = text.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace !== -1) {
-      return JSON.parse(text.substring(firstBrace, lastBrace + 1));
-    }
-    throw new Error("Could not parse valid JSON from AI response.");
-  }
-}
+import { groq, resolveModel, cleanAndParseJSON } from "@/lib/groq";
+import type { ChannelInput, RebalanceResponse } from "@/lib/types";
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const { channels, totalBudget, targetROAS, businessType } = body;
+    const { timeframe, channels } = (await req.json()) as {
+      timeframe: string;
+      channels: ChannelInput[];
+    };
 
-    const systemPrompt = `You are a Principal Media Buyer, Quantitative Growth Architect, and Multi-Channel Attribution Specialist.
-Analyze cross-platform advertising data (Meta, Google, TikTok, etc.) to mathematically detect ad fatigue, diminishing marginal returns, and allocate budget dynamically to maximize blended ROAS.
-Return ONLY a raw JSON object strictly adhering to this schema:
+    if (!channels || channels.length === 0) {
+      return NextResponse.json(
+        { error: "At least one channel is required." },
+        { status: 400 }
+      );
+    }
+
+    /* ── Pre-compute mathematically verifiable metrics ── */
+    const totalSpend = channels.reduce((s, c) => s + c.adSpend, 0);
+    const totalRevenue = channels.reduce((s, c) => s + c.revenue, 0);
+    const blendedROAS = totalSpend > 0 ? +(totalRevenue / totalSpend).toFixed(4) : 0;
+
+    const enriched = channels.map((c) => ({
+      platform: c.platform,
+      adSpend: c.adSpend,
+      revenue: c.revenue,
+      roas: c.adSpend > 0 ? +(c.revenue / c.adSpend).toFixed(4) : 0,
+      costPerRevenueDollar: c.revenue > 0 ? +(c.adSpend / c.revenue).toFixed(4) : 0,
+      creativeFormat: c.creativeFormat,
+      avgCTR: c.avgCTR,
+      spendSharePct: totalSpend > 0 ? +((c.adSpend / totalSpend) * 100).toFixed(1) : 0,
+    }));
+
+    /* ── System prompt: zero-hallucination enforcement ── */
+    const systemPrompt = `You are a Performance Marketing Budget Auditor. You analyze ONLY the provided channel data.
+
+ABSOLUTE RULES — VIOLATION MEANS FAILURE:
+1. ZERO HALLUCINATIONS. Every single number you output MUST be directly derived from the provided data.
+2. If a channel shows 1.4x ROAS, you MUST report exactly 1.4 — never 1.5, 2.0, or 3.0.
+3. Do NOT invent platforms, metrics, or data points not present in the input.
+4. All calculations must be mathematically verifiable: ROAS = revenue / spend, CPA (cost per revenue dollar) = spend / revenue.
+5. Do NOT reference external benchmarks, industry averages, or assumptions not in the data.
+6. When recommending budget shifts, recalculate the projected blended ROAS precisely after applying the shift.
+
+CREATIVE FATIGUE DETECTION RULES:
+- Flag as "creative decay / hook exhaustion" if Video Heavy CTR < 0.9% on any platform.
+- Flag as "banner blindness" if Static Banner Heavy CTR < 1.2% on search platforms.
+- If CTR is healthy (>= 1.5%), note as "creative performing well".
+- TikTok specifically: flag "hook exhaustion" if Video CTR < 0.8%.
+
+EFFICIENCY RATING RULES:
+- "Optimal": ROAS >= 2.5 AND CTR is healthy for its creative format.
+- "Fatigued": ROAS between 1.5 and 2.49, OR CTR shows fatigue signals.
+- "Bleeding": ROAS < 1.5 OR severe CTR degradation.
+
+You MUST output valid JSON matching the specified schema. No markdown, no explanations, no text outside the JSON object.`;
+
+    const userPrompt = `Analyze this performance marketing data and produce a rebalancing audit.
+
+ALL METRICS BELOW ARE PRE-COMPUTED AND MATHEMATICALLY VERIFIED. USE THESE EXACT NUMBERS.
+
+Timeframe: ${timeframe}
+Total Spend: $${totalSpend.toLocaleString()}
+Total Revenue: $${totalRevenue.toLocaleString()}
+Blended ROAS: ${blendedROAS}x
+
+Channel Breakdown (pre-computed):
+${JSON.stringify(enriched, null, 2)}
+
+Return ONLY a JSON object with this EXACT schema:
 {
-  "executiveSummary": "2-3 concise, punchy sentences explaining the core reallocation thesis and why certain channels are losing efficiency.",
-  "projectedBlendedROAS": "e.g. 3.42x (+22% uplift)",
-  "projectedRevenue": "e.g. $102,600",
-  "reallocations": [
+  "timeframe": "${timeframe}",
+  "blendedROAS": ${blendedROAS},
+  "executiveAudit": "2-4 sentence executive summary grounded in the numbers above",
+  "channelDiagnosis": [
     {
-      "channel": "Channel Name",
-      "currentSpend": 10000,
-      "recommendedSpend": 6500,
-      "changeAmount": "-$3,500",
-      "action": "DECREASE",
-      "rationale": "High frequency and rising CPA indicate creative fatigue on cold broad audiences."
+      "platform": "exact platform name from input",
+      "efficiencyRating": "Optimal | Fatigued | Bleeding",
+      "cpa": <costPerRevenueDollar from pre-computed data>,
+      "roas": <roas from pre-computed data>,
+      "creativeStatus": "assessment based on creative format + CTR",
+      "actionVerdict": "specific next step"
     }
   ],
-  "strategicActionItems": [
-    "Specific tactical instruction for media buyer (e.g. scale Google PMax budget by $2k focusing on top 5 SKUs)"
+  "budgetShiftDirectives": [
+    {
+      "fromPlatform": "name",
+      "toPlatform": "name",
+      "amount": <dollar amount>,
+      "mathematicalRationale": "cite exact ROAS numbers",
+      "projectedBlendedROAS": <recalculated number>
+    }
+  ],
+  "creativeFatigueAlerts": [
+    {
+      "platform": "name",
+      "trigger": "what triggered the alert with exact numbers",
+      "recommendation": "specific creative action"
+    }
   ]
 }`;
 
-    const userPrompt = `Business Model: ${businessType}
-Total Monthly Budget: $${totalBudget}
-Target Blended ROAS: ${targetROAS}x
+    const modelId = await resolveModel();
 
-Live Channel Performance Matrix:
-${JSON.stringify(channels, null, 2)}
+    const completion = await groq.chat.completions.create({
+      model: modelId,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature: 0.15,
+      response_format: { type: "json_object" },
+    });
 
-Diagnose diminishing returns, detect fatigue, and formulate the optimal mathematical budget rebalance plan. Output strictly raw JSON.`;
+    const raw = completion.choices[0]?.message?.content ?? "";
 
-    const modelListRes = await groq.models.list();
-    const candidateIds = modelListRes.data
-      .map((m: any) => m.id)
-      .filter((id: string) => {
-        const lower = id.toLowerCase();
-        return (
-          !lower.includes("whisper") &&
-          !lower.includes("guard") &&
-          !lower.includes("vision") &&
-          !lower.includes("safeguard") &&
-          !lower.includes("canopy") &&
-          !lower.includes("orpheus") &&
-          !lower.includes("tts") &&
-          !lower.includes("audio")
-        );
-      });
-
-    const priorityList = [
-      "llama-3.1-8b-instant",
-      "llama-3.3-70b-versatile",
-      "llama-3.2-3b-preview",
-      ...candidateIds,
-    ];
-
-    const availableToTry = Array.from(
-      new Set(priorityList.filter((p) => candidateIds.includes(p)))
-    );
-
-    let completion = null;
-    let lastError: any = null;
-
-    for (const model of availableToTry) {
-      try {
-        completion = await groq.chat.completions.create({
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          model: model,
-          temperature: 0.3,
-          max_tokens: 2048,
-          response_format: { type: "json_object" },
-        });
-
-        if (completion?.choices[0]?.message?.content) {
-          break;
-        }
-      } catch (err: any) {
-        lastError = err;
-      }
+    let parsed: RebalanceResponse;
+    try {
+      parsed = cleanAndParseJSON(raw) as RebalanceResponse;
+    } catch {
+      return NextResponse.json(
+        { error: "Model returned unparseable response. Please retry." },
+        { status: 502 }
+      );
     }
 
-    const responseContent = completion?.choices[0]?.message?.content || "";
-    if (!responseContent) {
-      throw lastError || new Error("No response from Groq models");
-    }
+    // Guard: force blendedROAS to the server-computed value
+    parsed.blendedROAS = blendedROAS;
+    parsed.timeframe = timeframe;
 
-    const parsedData = cleanAndParseJSON(responseContent);
-    return NextResponse.json(parsedData);
+    return NextResponse.json({ success: true, data: parsed });
   } catch (error: any) {
-    console.error("Budget Rebalance Error:", error);
+    console.error("Rebalance Pipeline Error:", error);
     return NextResponse.json(
-      { error: error.message || "Failed to rebalance budget matrix" },
+      { error: error.message || "Failed to process budget rebalance audit." },
       { status: 500 }
     );
   }
